@@ -24,6 +24,16 @@ def load_data(path: str):
     df = pd.read_csv(path)
     return df
 
+@st.cache_data
+def load_tally_csv(path: str):
+    t = pd.read_csv(path)
+    # Expected columns: month, sales_amount
+    t["month"] = pd.to_datetime(t["month"], errors="coerce")
+    t["sales_amount"] = pd.to_numeric(t["sales_amount"], errors="coerce")
+    t = t.dropna(subset=["month", "sales_amount"]).sort_values("month")
+    return t
+
+
 def make_canonical(df: pd.DataFrame):
     # Works for weekly and daily datasets
     date_col = "week" if "week" in df.columns else "date"
@@ -186,6 +196,8 @@ with st.sidebar:
     st.header("Data")
     default_path = "FMCG_2022_2024.csv"
     data_path = st.text_input("CSV path", value=default_path)
+    st.subheader("Real Client (Tally)")
+    tally_path = st.text_input("Tally CSV path", value="tally_sales.csv")
     top_n = st.slider("Top SKUs to analyze", 5, 30, 15)
     st.header("Practical knobs")
     on_order_pct = st.slider("Assumed on-order %", 0.0, 1.0, float(ON_ORDER_BUFFER_PCT), 0.05)
@@ -219,7 +231,7 @@ k2.metric("Total order qty (top N)", f"{action_feed['recommended_order_qty'].sum
 k3.metric("Avg risk after (%)", f"{action_feed['stockout_risk_after_pct'].dropna().mean():.1f}")
 k4.metric("Avg coverage (weeks)", f"{action_feed['coverage_weeks_on_hand'].dropna().mean():.2f}")
 
-tabs = st.tabs(["Action Feed", "SKU Drilldown"])
+tabs = st.tabs(["Action Feed", "SKU Drilldown", "Real Client (Tally)"])
 
 with tabs[0]:
     st.subheader("Weekly Action Feed (Approve/Reject-ready)")
@@ -232,6 +244,33 @@ with tabs[1]:
     sku = st.selectbox("Select SKU", sorted(canon["sku"].unique()))
     df_sku = canon[canon["sku"] == sku].sort_values("week").copy()
     s = demand_series(df_sku)
+    
+with tabs[2]:
+    st.subheader("Real Client Validation (Tally)")
+
+    try:
+        tally_df = load_tally_csv(tally_path)
+    except Exception as e:
+        st.error(f"Could not load Tally CSV at '{tally_path}'. Error: {e}")
+        st.stop()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Months", len(tally_df))
+    c2.metric("Total Sales (₹)", f"{tally_df['sales_amount'].sum():,.0f}")
+    c3.metric("Avg Monthly Sales (₹)", f"{tally_df['sales_amount'].mean():,.0f}")
+
+    st.markdown("**Monthly Sales Trend (Real Client)**")
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 3))
+    plt.plot(tally_df["month"], tally_df["sales_amount"])
+    plt.tight_layout()
+    st.pyplot(plt.gcf())
+    plt.close()
+
+    st.dataframe(tally_df, use_container_width=True, height=350)
+
+    st.info("This tab shows real MSME sales (Tally). The other tabs demonstrate the AI decision engine (forecast → reorder).")
+
 
     f_next = ets_forecast_next(s)
     lt = lead_time_weeks(df_sku)
