@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from datetime import datetime
 from math import ceil, sqrt, erf
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
@@ -235,9 +236,106 @@ tabs = st.tabs(["Action Feed", "SKU Drilldown", "Real Client (Tally)"])
 
 with tabs[0]:
     st.subheader("Weekly Action Feed (Approve/Reject-ready)")
-    risk_filter = st.multiselect("Filter risk", ["HIGH","MED","NORMAL","UNKNOWN_STOCK"], default=["HIGH","MED","NORMAL"])
+    st.markdown("### Business Impact (Estimated)")
+
+    # Use the full action_feed (before risk filtering) for true KPI view
+    tmp_imp = action_feed.copy()
+    tmp_imp["risk_before"] = tmp_imp["stockout_risk_before_pct"].fillna(0) / 100.0
+    tmp_imp["risk_after"]  = tmp_imp["stockout_risk_after_pct"].fillna(0) / 100.0
+
+    # Units avoided proxy = forecast * (risk_before - risk_after)
+    tmp_imp["units_avoided"] = (tmp_imp["forecast_next_week_units"] * (tmp_imp["risk_before"] - tmp_imp["risk_after"])).clip(lower=0)
+    units_avoided = float(tmp_imp["units_avoided"].sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("MED/HIGH items", int((action_feed["risk_flag"].isin(["MED","HIGH"])).sum()))
+    c2.metric("Total order qty (top N)", f"{action_feed['recommended_order_qty'].sum():.0f}")
+    c3.metric("Avg risk after (%)", f"{action_feed['stockout_risk_after_pct'].dropna().mean():.1f}")
+    c4.metric("Potential lost sales avoided (units)", f"{units_avoided:,.0f}")
+
+    avg_price = st.slider("Avg selling price per unit (₹) — impact simulator", 1, 500, 50)
+    revenue_protected = units_avoided * avg_price
+    st.metric("Estimated Revenue Protected (₹)", f"{revenue_protected:,.0f}")
+    st.caption("Estimate = forecast × (risk_before − risk_after). Replace avg price with real SKU pricing later.")
+
+    st.markdown("### Weekly Action Feed (Approve/Reject + Decision Log)")
+
+    risk_filter = st.multiselect(
+        "Filter risk",
+        ["HIGH","MED","NORMAL","UNKNOWN_STOCK"],
+        default=["HIGH","MED","NORMAL"]
+    )
+
     view = action_feed[action_feed["risk_flag"].isin(risk_filter)].copy()
-    st.dataframe(view, use_container_width=True, height=520)
+
+    # --- Decision workflow (persistent in session) ---
+    if "decision_log" not in st.session_state:
+        st.session_state.decision_log = {}
+
+    # Add decision + note columns
+    if "decision" not in view.columns:
+        view["decision"] = "PENDING"
+    if "note" not in view.columns:
+        view["note"] = ""
+
+    # Populate from session_state
+    for i, r in view.iterrows():
+        sku = r["sku"]
+        if sku in st.session_state.decision_log:
+            view.at[i, "decision"] = st.session_state.decision_log[sku].get("decision", "PENDING")
+            view.at[i, "note"] = st.session_state.decision_log[sku].get("note", "")
+
+    # Use Streamlit data editor for approve/reject
+    edited = st.data_editor(
+        view,
+        use_container_width=True,
+        height=520,
+        column_config={
+            "decision": st.column_config.SelectboxColumn(
+                "decision",
+                options=["APPROVE", "REJECT", "DEFER", "PENDING"],
+                required=True,
+            ),
+            "note": st.column_config.TextColumn("note"),
+        },
+        disabled=[
+            "sku","forecast_next_week_units","lead_time_weeks","sigma_weekly",
+            "safety_stock_used","assumed_on_order","current_stock_units",
+            "stock_position_proxy","order_up_to_units","recommended_order_qty",
+            "coverage_weeks_on_hand","stockout_risk_before_pct","stockout_risk_after_pct",
+            "priority_score","lost_sales_avoided_proxy","risk_flag"
+        ],
+    )
+
+    # Save decisions back to session_state
+    for _, r in edited.iterrows():
+        sku = r["sku"]
+        st.session_state.decision_log[sku] = {
+            "decision": r["decision"],
+            "note": r.get("note", ""),
+            "timestamp": datetime.now().isoformat(timespec="seconds")
+        }
+
+    # Create downloadable decision log
+    log_rows = []
+    for sku, v in st.session_state.decision_log.items():
+        log_rows.append({"sku": sku, **v})
+    log_df = pd.DataFrame(log_rows).sort_values(["timestamp","sku"], ascending=[False, True]) if log_rows else pd.DataFrame(columns=["sku","decision","note","timestamp"])
+
+    st.download_button(
+        "Download Decision Log CSV",
+        data=log_df.to_csv(index=False).encode("utf-8"),
+        file_name="decision_log.csv",
+        mime="text/csv"
+    )
+
+    st.download_button(
+        "Download Action Feed (with decisions) CSV",
+        data=edited.to_csv(index=False).encode("utf-8"),
+        file_name="action_feed_with_decisions.csv",
+        mime="text/csv"
+    )
+
 
 with tabs[1]:
     st.subheader("SKU Drilldown")
@@ -250,6 +348,31 @@ with tabs[2]:
 
     try:
         tally_df = load_tally_csv(tally_path)
+        # MoM growth + run-rate metrics
+        t = tally_df.copy()
+        t["mom_growth_pct"] = t["sales_amount"].pct_change() * 100.0
+
+        last_3 = t["sales_amount"].tail(3)
+        run_rate = float(last_3.mean() * 12) if len(last_3) >= 1 else float("nan")
+
+        best_row = t.loc[t["sales_amount"].idxmax()]
+        worst_row = t.loc[t["sales_amount"].idxmin()]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Sales (₹)", f"{t['sales_amount'].sum():,.0f}")
+        c2.metric("Run-rate (₹/year, last 3 mo avg × 12)", f"{run_rate:,.0f}")
+        c3.metric("Best Month", f"{best_row['month'].strftime('%Y-%m')} | ₹{best_row['sales_amount']:,.0f}")
+        c4.metric("Worst Month", f"{worst_row['month'].strftime('%Y-%m')} | ₹{worst_row['sales_amount']:,.0f}")
+
+        st.markdown("**Month-over-Month Growth (%)**")
+        st.dataframe(
+            t[["month","sales_amount","mom_growth_pct"]].assign(
+                month=lambda x: x["month"].dt.strftime("%Y-%m")
+            ),
+            use_container_width=True,
+            height=260
+        )
+
     except Exception as e:
         st.error(f"Could not load Tally CSV at '{tally_path}'. Error: {e}")
         st.stop()
