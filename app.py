@@ -426,6 +426,59 @@ with tabs[2]:
 
     try:
         tally_df = load_tally_csv(tally_path)
+        # -----------------------------
+        # Monthly sales forecasting (ETS)
+        # -----------------------------
+        sales_series = (
+            tally_df.sort_values("month")
+            .set_index("month")["sales_amount"]
+            .asfreq("MS")
+        )
+
+        try:
+            ets_model = ExponentialSmoothing(
+                sales_series,
+                trend="add",
+                seasonal=None,
+                initialization_method="estimated"
+            ).fit()
+            next_month_forecast = float(ets_model.forecast(1).iloc[0])
+        except Exception:
+            next_month_forecast = float(sales_series.iloc[-1])
+
+        # -----------------------------
+        # Business risk (revenue drop risk)
+        # -----------------------------
+        recent_avg = sales_series.tail(3).mean()
+        sigma = sales_series.tail(6).std()
+
+        if sigma > 0:
+            z = (recent_avg - next_month_forecast) / sigma
+            drop_risk_pct = (1 - norm_cdf(z)) * 100
+        else:
+            drop_risk_pct = 0.0
+
+        # -----------------------------
+        # Metrics
+        # -----------------------------
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Forecast next month sales (₹)", f"{next_month_forecast:,.0f}")
+        c2.metric("Recent 3-month avg (₹)", f"{recent_avg:,.0f}")
+        c3.metric("Revenue drop risk (%)", f"{drop_risk_pct:.1f}")
+
+        # -----------------------------
+        # Plot: Sales trend + forecast
+        # -----------------------------
+        st.markdown("### Monthly Sales Trend (with Forecast)")
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(sales_series.index, sales_series.values, label="Actual sales")
+        plt.axhline(next_month_forecast, linestyle="--", color="orange", label="Next month forecast")
+        plt.legend()
+        plt.tight_layout()
+        st.pyplot(plt.gcf())
+        plt.close()
+
 
         t = tally_df.copy()
         t["mom_growth_pct"] = t["sales_amount"].pct_change() * 100.0
