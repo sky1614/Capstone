@@ -339,9 +339,72 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("SKU Drilldown")
-    sku = st.selectbox("Select SKU", sorted(canon["sku"].unique()))
-    df_sku = canon[canon["sku"] == sku].sort_values("week").copy()
-    s = demand_series(df_sku)
+
+    # --- Select SKU from FULL dataset, not filtered view ---
+    all_skus = sorted(df["sku"].unique())
+    sel_sku = st.selectbox("Select SKU", all_skus)
+
+    # --- Filter full history for selected SKU ---
+    sku_hist = df[df["sku"] == sel_sku].sort_values("week")
+
+    if sku_hist.empty:
+        st.warning("No data available for this SKU.")
+        st.stop()
+
+    # --- Prepare series ---
+    y = sku_hist.set_index("week")["units_sold"]
+
+    # --- Forecast (same model as Tab 1) ---
+    try:
+        model = ExponentialSmoothing(y, trend="add", seasonal=None)
+        fit = model.fit(optimized=True)
+        f_next = fit.forecast(1).iloc[0]
+    except Exception:
+        f_next = y.iloc[-1]
+
+    # --- Plot 1: Actual sales + forecast ---
+    st.markdown("### Sales Trend (Actual vs Forecast)")
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(y.index, y.values, label="Actual sales")
+    ax.axhline(f_next, linestyle="--", color="orange", label="Next-week forecast")
+    ax.legend()
+    ax.set_ylabel("Units sold")
+    st.pyplot(fig)
+
+    # --- Stock numbers ---
+    current_stock = sku_hist["stock_available"].iloc[-1]
+    lead_time = max(1, int(np.ceil(sku_hist["delivery_days"].median() / 7)))
+
+    sigma = y.tail(12).std()
+    safety_stock = min(1.645 * sigma * np.sqrt(lead_time), 0.6 * f_next * lead_time)
+    order_up_to = f_next * lead_time + safety_stock
+
+    on_order = 0.3 * f_next * lead_time
+
+    # --- Plot 2: Stock position vs target ---
+    st.markdown("### Stock Position vs Target")
+
+    fig2, ax2 = plt.subplots(figsize=(6, 4))
+    ax2.bar(
+        ["On-hand", "On-order (assumed)", "Target (order-up-to)"],
+        [current_stock, on_order, order_up_to]
+    )
+    st.pyplot(fig2)
+
+    # --- Explain numbers ---
+    st.markdown("### Key Numbers (Explainable)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Forecast next week", f"{f_next:.0f}")
+    c2.metric("Current stock", f"{current_stock:.0f}")
+    c3.metric("Safety stock", f"{safety_stock:.0f}")
+    c4.metric("Recommended target", f"{order_up_to:.0f}")
+
+    st.caption(
+        "This view explains *why* the system recommends a certain order quantity "
+        "by showing demand trend, stock position, and safety buffer."
+    )
+
     
 with tabs[2]:
     st.subheader("Real Client Validation (Tally)")
